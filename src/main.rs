@@ -187,12 +187,20 @@ fn extract_archive(archive: &Path, extract_dir: &Path) -> io::Result<PathBuf> {
 fn do_bu(args: &BuArgs) -> io::Result<()> {
     let a = alphabet();
     let src = Path::new(&args.target);
-    let dst = Path::new(&args.dest);
+    let dst_str = args.dest.trim_end_matches('/');
+    let dst = Path::new(dst_str);
 
     if !src.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!("target does not exist: {}", args.target),
+        ));
+    }
+
+    if dst.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("--dest must be a file path, not a directory: {}", dst.display()),
         ));
     }
 
@@ -246,12 +254,20 @@ fn do_bu(args: &BuArgs) -> io::Result<()> {
 fn do_rs(args: &RsArgs) -> io::Result<()> {
     let a = alphabet();
     let src = Path::new(&args.target);
-    let dst = Path::new(&args.dest);
+    let dst_str = args.dest.trim_end_matches('/');
+    let dst = Path::new(dst_str);
 
     if !src.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!("target does not exist: {}", args.target),
+        ));
+    }
+
+    if dst.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("--dest must be a file path, not a directory: {}", dst.display()),
         ));
     }
 
