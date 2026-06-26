@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand};
+use gzp::{deflate::Gzip, ZBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::{
@@ -143,10 +144,78 @@ fn tmp_dir_for(dest: &Path) -> io::Result<PathBuf> {
     Ok(parent.join(format!(".sunnyside_tmp_{}", name)))
 }
 
+fn compress_target(src: &Path, dst: &Path) -> io::Result<()> {
+    let out = File::create(dst)?;
+    let parz = ZBuilder::<Gzip, _>::new().num_threads(0).from_writer(out);
+    let mut tar_builder = tar::Builder::new(parz);
+    let name = src.file_name().unwrap();
+    if src.is_dir() {
+        tar_builder.append_dir_all(name, src)?;
+    } else {
+        tar_builder.append_path_with_name(src, name)?;
+    }
+    tar_builder
+        .into_inner()?
+        .finish()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    Ok(())
+}
+
 // ── BU / RS (stubs — implemented in Tasks 2 and 3) ──────────────────────────
 
-fn do_bu(_args: &BuArgs) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Other, "bu not yet implemented"))
+fn do_bu(args: &BuArgs) -> io::Result<()> {
+    let a = alphabet();
+    let src = Path::new(&args.target);
+    let dst = Path::new(&args.dest);
+
+    if !src.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("target does not exist: {}", args.target),
+        ));
+    }
+
+    if let Some(p) = dst.parent() {
+        if !p.as_os_str().is_empty() {
+            fs::create_dir_all(p)?;
+        }
+    }
+
+    let tmp = tmp_dir_for(dst)?;
+    if tmp.exists() {
+        fs::remove_dir_all(&tmp)?;
+    }
+    fs::create_dir_all(&tmp)?;
+
+    let src_name = src.file_name().unwrap().to_str().unwrap().to_string();
+
+    let pb = spinner("[1/4] Compressing...");
+    let compressed = tmp.join(&src_name);
+    compress_target(src, &compressed)?;
+    pb.finish_with_message("[1/4] Compressed  ✓");
+
+    let pb = spinner("[2/4] Scrambling...");
+    scramble_inplace(&compressed, args.key)?;
+    pb.finish_with_message("[2/4] Scrambled   ✓");
+
+    let pb = spinner("[3/4] Shifting name...");
+    let shifted_name = format!("{}.tyz", shift_name(&src_name, args.shift, &a));
+    fs::rename(&compressed, tmp.join(&shifted_name))?;
+    pb.finish_with_message("[3/4] Shifted     ✓");
+
+    let pb = spinner("[4/4] Finalizing...");
+    if dst.exists() {
+        if dst.is_dir() {
+            fs::remove_dir_all(dst)?;
+        } else {
+            fs::remove_file(dst)?;
+        }
+    }
+    fs::rename(tmp.join(&shifted_name), dst)?;
+    fs::remove_dir_all(&tmp)?;
+    pb.finish_with_message("[4/4] Done        ✓");
+
+    Ok(())
 }
 
 fn do_rs(_args: &RsArgs) -> io::Result<()> {
