@@ -129,10 +129,18 @@ fn spinner(msg: &str) -> ProgressBar {
     pb
 }
 
-fn tmp_dir_for(dest: &Path) -> PathBuf {
+fn tmp_dir_for(dest: &Path) -> io::Result<PathBuf> {
     let parent = dest.parent().unwrap_or(Path::new("."));
-    let name = dest.file_name().unwrap().to_str().unwrap();
-    parent.join(format!(".sunnyside_tmp_{}", name))
+    let name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "dest path has no filename component",
+            )
+        })?;
+    Ok(parent.join(format!(".sunnyside_tmp_{}", name)))
 }
 
 // ── BU / RS (stubs — implemented in Tasks 2 and 3) ──────────────────────────
