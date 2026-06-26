@@ -1,11 +1,12 @@
 use clap::{Args, Parser, Subcommand};
+use flate2::read::MultiGzDecoder;
 use gzp::{deflate::Gzip, ZBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process,
 };
@@ -148,7 +149,9 @@ fn compress_target(src: &Path, dst: &Path) -> io::Result<()> {
     let out = File::create(dst)?;
     let parz = ZBuilder::<Gzip, _>::new().num_threads(0).from_writer(out);
     let mut tar_builder = tar::Builder::new(parz);
-    let name = src.file_name().unwrap();
+    let name = src.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "source path has no filename component")
+    })?;
     if src.is_dir() {
         tar_builder.append_dir_all(name, src)?;
     } else {
@@ -161,7 +164,25 @@ fn compress_target(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
-// ── BU / RS (stubs — implemented in Tasks 2 and 3) ──────────────────────────
+fn extract_archive(archive: &Path, extract_dir: &Path) -> io::Result<PathBuf> {
+    fs::create_dir_all(extract_dir)?;
+    let f = File::open(archive)?;
+    let dec = MultiGzDecoder::new(BufReader::new(f));
+    let mut tar = tar::Archive::new(dec);
+    tar.unpack(extract_dir)?;
+    let mut roots: Vec<PathBuf> = fs::read_dir(extract_dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    if roots.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("expected 1 archive root entry, found {}", roots.len()),
+        ));
+    }
+    Ok(roots.remove(0))
+}
+
+// ── BU / RS ──────────────────────────────────────────────────────────────────
 
 fn do_bu(args: &BuArgs) -> io::Result<()> {
     let a = alphabet();
@@ -187,7 +208,11 @@ fn do_bu(args: &BuArgs) -> io::Result<()> {
     }
     fs::create_dir_all(&tmp)?;
 
-    let src_name = src.file_name().unwrap().to_str().unwrap().to_string();
+    let src_name = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source path has no filename component"))?
+        .to_string();
 
     let pb = spinner("[1/4] Compressing...");
     let compressed = tmp.join(&src_name);
@@ -218,8 +243,65 @@ fn do_bu(args: &BuArgs) -> io::Result<()> {
     Ok(())
 }
 
-fn do_rs(_args: &RsArgs) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Other, "rs not yet implemented"))
+fn do_rs(args: &RsArgs) -> io::Result<()> {
+    let a = alphabet();
+    let src = Path::new(&args.target);
+    let dst = Path::new(&args.dest);
+
+    if !src.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("target does not exist: {}", args.target),
+        ));
+    }
+
+    if let Some(p) = dst.parent() {
+        if !p.as_os_str().is_empty() {
+            fs::create_dir_all(p)?;
+        }
+    }
+
+    let tmp = tmp_dir_for(dst)?;
+    if tmp.exists() {
+        fs::remove_dir_all(&tmp)?;
+    }
+    fs::create_dir_all(&tmp)?;
+
+    let src_name = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source path has no filename component"))?
+        .to_string();
+    let shifted_base = src_name.strip_suffix(".tyz").unwrap_or(&src_name);
+    let original_name = unshift_name(shifted_base, args.shift, &a);
+
+    let pb = spinner("[1/4] Preparing...");
+    let tmp_archive = tmp.join(&original_name);
+    fs::copy(src, &tmp_archive)?;
+    pb.finish_with_message("[1/4] Prepared    ✓");
+
+    let pb = spinner("[2/4] Descrambling...");
+    scramble_inplace(&tmp_archive, args.key)?;
+    pb.finish_with_message("[2/4] Descrambled ✓");
+
+    let pb = spinner("[3/4] Decompressing...");
+    let extract_dir = tmp.join("extract");
+    let extracted = extract_archive(&tmp_archive, &extract_dir)?;
+    pb.finish_with_message("[3/4] Decompressed ✓");
+
+    let pb = spinner("[4/4] Finalizing...");
+    if dst.exists() {
+        if dst.is_dir() {
+            fs::remove_dir_all(dst)?;
+        } else {
+            fs::remove_file(dst)?;
+        }
+    }
+    fs::rename(extracted, dst)?;
+    fs::remove_dir_all(&tmp)?;
+    pb.finish_with_message("[4/4] Done        ✓");
+
+    Ok(())
 }
 
 // ── MAIN ─────────────────────────────────────────────────────────────────────
