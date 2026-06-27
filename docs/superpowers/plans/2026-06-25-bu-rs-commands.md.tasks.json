@@ -1,0 +1,33 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-25-bu-rs-commands.md",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 1: Add dependencies and restructure CLI with shared helpers",
+      "status": "pending",
+      "description": "**Goal:** Update Cargo.toml with new dependencies and rewrite main.rs with the new clap subcommand structure and all shared helper functions, while keeping the legacy flat-arg mode working exactly as before.\n\n**Files:**\n- Modify: `sunnyside/Cargo.toml`\n- Modify: `sunnyside/src/main.rs`\n\n**Acceptance Criteria:**\n- [ ] `cargo build` succeeds with zero errors\n- [ ] `./target/debug/sunnyside --help` lists both `bu` and `rs` subcommands\n- [ ] `./target/debug/sunnyside bu --help` shows `--target`, `--shift`, `--key`, `--dest` flags\n- [ ] Legacy mode still works: echo hi > /tmp/ss_test.txt && sunnyside -t /tmp/ss_test.txt -s 0 -k x produces /tmp/ss_test.tyz\n\n**Verify:** `cargo build 2>&1 | tail -2` → `Finished dev [unoptimized + debuginfo] target(s) in X.XXs`\n\n```json:metadata\n{\"files\": [\"sunnyside/Cargo.toml\", \"sunnyside/src/main.rs\"], \"verifyCommand\": \"cd sunnyside && cargo build 2>&1 | tail -2\", \"acceptanceCriteria\": [\"cargo build succeeds\", \"sunnyside --help lists bu and rs\", \"legacy flat-arg mode still works\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Implement bu subcommand",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "**Goal:** Implement `compress_target` (parallel gzip tar archive) and `do_bu` (4-stage backup pipeline), replacing the Task 1 stub.\n\n**Files:**\n- Modify: `sunnyside/src/main.rs` (add gzp import, compress_target function, replace do_bu stub)\n\n**Acceptance Criteria:**\n- [ ] `cargo build` succeeds\n- [ ] `sunnyside bu -t <file> -s 4 -k u -d /tmp/bu_test.tyz` creates `/tmp/bu_test.tyz`\n- [ ] `sunnyside bu -t <dir> -s 4 -k u -d /tmp/bu_dir.tyz` creates `/tmp/bu_dir.tyz`\n- [ ] No temp dir remains after successful bu\n- [ ] `--target` file/directory is not modified by bu\n\n**Verify:** `cargo build && echo TEST > /tmp/bu_src.txt && ./target/debug/sunnyside bu -t /tmp/bu_src.txt -s 4 -k u -d /tmp/bu_out.tyz && ls -lh /tmp/bu_out.tyz` → shows file with non-zero size\n\n```json:metadata\n{\"files\": [\"sunnyside/src/main.rs\"], \"verifyCommand\": \"cd sunnyside && cargo build && echo TEST > /tmp/bu_src.txt && ./target/debug/sunnyside bu -t /tmp/bu_src.txt -s 4 -k u -d /tmp/bu_out.tyz && ls -lh /tmp/bu_out.tyz\", \"acceptanceCriteria\": [\"cargo build succeeds\", \"bu creates dest file\", \"bu works on directories\", \"no temp dir remains\", \"source not modified\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Implement rs subcommand",
+      "status": "pending",
+      "blockedBy": [2],
+      "description": "**Goal:** Implement `extract_archive` (multi-member gzip decompression + tar extraction) and `do_rs` (4-stage restore pipeline). Must use `MultiGzDecoder` because `gzp` emits concatenated multi-member gzip.\n\n**Files:**\n- Modify: `sunnyside/src/main.rs` (add flate2 + BufReader imports, extract_archive function, replace do_rs stub)\n\n**Acceptance Criteria:**\n- [ ] `cargo build` succeeds\n- [ ] File round-trip: bu a file then rs it → restored content matches original\n- [ ] Directory round-trip: bu a directory then rs it → restored structure matches original\n- [ ] No temp dir remains after successful rs\n- [ ] `--target` backup file is not modified or deleted by rs\n\n**Verify:** `echo ROUNDTRIP > /tmp/rt_src.txt && ./target/debug/sunnyside bu -t /tmp/rt_src.txt -s 4 -k u -d /tmp/rt.tyz && ./target/debug/sunnyside rs -t /tmp/rt.tyz -s 4 -k u -d /tmp/rt_out.txt && cat /tmp/rt_out.txt` → `ROUNDTRIP`\n\n```json:metadata\n{\"files\": [\"sunnyside/src/main.rs\"], \"verifyCommand\": \"cd sunnyside && echo ROUNDTRIP > /tmp/rt_src.txt && ./target/debug/sunnyside bu -t /tmp/rt_src.txt -s 4 -k u -d /tmp/rt.tyz && ./target/debug/sunnyside rs -t /tmp/rt.tyz -s 4 -k u -d /tmp/rt_out.txt && cat /tmp/rt_out.txt\", \"acceptanceCriteria\": [\"cargo build succeeds\", \"file round-trip restores content\", \"directory round-trip restores structure\", \"no temp dirs remain\", \"source backup not modified\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: anixpkgs integration — package update and regression tests",
+      "status": "pending",
+      "blockedBy": [3],
+      "description": "**Goal:** Update the anixpkgs sunnyside package to point at the new sunnyside version, update the cargo hash, and add bu/rs regression tests to `test_sunnyside.sh`. Requires Tasks 1–3 pushed to GitHub.\n\n**Files:**\n- Modify: `anixpkgs/pkgs/rust-packages/sunnyside/default.nix`\n- Modify: `anixpkgs/test/test_sunnyside.sh`\n\n**Acceptance Criteria:**\n- [ ] `nix flake update sunnyside` completes in anixpkgs\n- [ ] anixpkgs sunnyside package builds without hash mismatch errors\n- [ ] bu/rs regression tests pass\n\n**Verify:** `cd anixpkgs && nix-shell test/shell.nix --run \"cd test && bash test_sunnyside.sh\"` exits 0 with no red output\n\n```json:metadata\n{\"files\": [\"anixpkgs/pkgs/rust-packages/sunnyside/default.nix\", \"anixpkgs/test/test_sunnyside.sh\"], \"verifyCommand\": \"cd anixpkgs && nix-shell test/shell.nix --run \\\"cd test && bash test_sunnyside.sh\\\"\", \"acceptanceCriteria\": [\"flake.lock updated\", \"package builds with correct cargoHash\", \"bu/rs regression tests pass\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-25T00:00:00Z"
+}

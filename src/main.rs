@@ -1,16 +1,45 @@
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
+use flate2::read::MultiGzDecoder;
+use gzp::{deflate::Gzip, ZBuilder};
+use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, Read, Write};
-use std::path::Path;
-use std::process;
+use std::{
+    collections::HashMap,
+    fs::{self, File, OpenOptions},
+    io::{self, BufReader, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    process,
+};
 
-/// Make some scrambled eggs.
+// ── CLI ──────────────────────────────────────────────────────────────────────
+
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// File target.
+#[command(author, version, about = "Make some scrambled eggs.", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+    /// File target (legacy mode).
+    #[arg(short, long)]
+    target: Option<String>,
+    /// Shift amount (legacy mode).
+    #[arg(short, long)]
+    shift: Option<usize>,
+    /// Scramble key (legacy mode).
+    #[arg(short, long)]
+    key: Option<char>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Backup: compress, scramble, and store a file or directory tree.
+    Bu(BuArgs),
+    /// Restore: descramble and decompress a backup.
+    Rs(RsArgs),
+}
+
+#[derive(Args, Debug)]
+struct BuArgs {
+    /// Source file or directory to back up.
     #[arg(short, long)]
     target: String,
     /// Shift amount.
@@ -19,10 +48,303 @@ struct Args {
     /// Scramble key.
     #[arg(short, long)]
     key: char,
+    /// Destination backup file path.
+    #[arg(short, long)]
+    dest: String,
 }
 
+#[derive(Args, Debug)]
+struct RsArgs {
+    /// Backup file to restore.
+    #[arg(short, long)]
+    target: String,
+    /// Shift amount (must match the bu call).
+    #[arg(short, long)]
+    shift: usize,
+    /// Scramble key (must match the bu call).
+    #[arg(short, long)]
+    key: char,
+    /// Destination path to restore to.
+    #[arg(short, long)]
+    dest: String,
+}
+
+// ── SHARED HELPERS ───────────────────────────────────────────────────────────
+
+fn alphabet() -> Vec<char> {
+    ('a'..='z')
+        .chain('A'..='Z')
+        .chain(std::iter::once('.'))
+        .chain('0'..='9')
+        .collect()
+}
+
+fn shift_name(name: &str, shift: usize, a: &[char]) -> String {
+    let n = a.len();
+    let s = shift % n;
+    let tbl: HashMap<char, char> = a
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| (c, a[(i + s) % n]))
+        .collect();
+    name.chars().map(|c| *tbl.get(&c).unwrap_or(&c)).collect()
+}
+
+fn unshift_name(name: &str, shift: usize, a: &[char]) -> String {
+    let n = a.len();
+    let s = shift % n;
+    let tbl: HashMap<char, char> = a
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| (c, a[(i + n - s) % n]))
+        .collect();
+    name.chars().map(|c| *tbl.get(&c).unwrap_or(&c)).collect()
+}
+
+fn scramble_inplace(path: &Path, key: char) -> io::Result<()> {
+    let lve = key as u8;
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
+    let mut pos = 0u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let out: Vec<u8> = buf[..n].par_iter().map(|&b| b ^ lve).collect();
+        file.seek(SeekFrom::Start(pos))?;
+        file.write_all(&out)?;
+        pos += n as u64;
+    }
+    Ok(())
+}
+
+fn spinner(msg: &str) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    pb.set_message(msg.to_string());
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    pb
+}
+
+fn tmp_dir_for(dest: &Path) -> io::Result<PathBuf> {
+    let parent = dest.parent().unwrap_or(Path::new("."));
+    let name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "dest path has no filename component",
+            )
+        })?;
+    Ok(parent.join(format!(".sunnyside_tmp_{}", name)))
+}
+
+fn compress_target(src: &Path, dst: &Path) -> io::Result<()> {
+    let out = File::create(dst)?;
+    let parz = ZBuilder::<Gzip, _>::new().num_threads(0).from_writer(out);
+    let mut tar_builder = tar::Builder::new(parz);
+    let name = src.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "source path has no filename component")
+    })?;
+    if src.is_dir() {
+        tar_builder.append_dir_all(name, src)?;
+    } else {
+        tar_builder.append_path_with_name(src, name)?;
+    }
+    tar_builder
+        .into_inner()?
+        .finish()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    Ok(())
+}
+
+fn extract_archive(archive: &Path, extract_dir: &Path) -> io::Result<PathBuf> {
+    fs::create_dir_all(extract_dir)?;
+    let f = File::open(archive)?;
+    let dec = MultiGzDecoder::new(BufReader::new(f));
+    let mut tar = tar::Archive::new(dec);
+    tar.unpack(extract_dir)?;
+    let mut roots: Vec<PathBuf> = fs::read_dir(extract_dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    if roots.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("expected 1 archive root entry, found {}", roots.len()),
+        ));
+    }
+    Ok(roots.remove(0))
+}
+
+// ── BU / RS ──────────────────────────────────────────────────────────────────
+
+fn do_bu(args: &BuArgs) -> io::Result<()> {
+    let a = alphabet();
+    let src = Path::new(&args.target);
+    let dst_str = args.dest.trim_end_matches('/');
+    let dst = Path::new(dst_str);
+
+    if !src.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("target does not exist: {}", args.target),
+        ));
+    }
+
+    if dst.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("--dest must be a file path, not a directory: {}", dst.display()),
+        ));
+    }
+
+    if let Some(p) = dst.parent() {
+        if !p.as_os_str().is_empty() {
+            fs::create_dir_all(p)?;
+        }
+    }
+
+    let tmp = tmp_dir_for(dst)?;
+    if tmp.exists() {
+        fs::remove_dir_all(&tmp)?;
+    }
+    fs::create_dir_all(&tmp)?;
+
+    let src_name = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source path has no filename component"))?
+        .to_string();
+
+    let pb = spinner("[1/4] Compressing...");
+    let compressed = tmp.join(&src_name);
+    compress_target(src, &compressed)?;
+    pb.finish_with_message("[1/4] Compressed  ✓");
+
+    let pb = spinner("[2/4] Scrambling...");
+    scramble_inplace(&compressed, args.key)?;
+    pb.finish_with_message("[2/4] Scrambled   ✓");
+
+    let pb = spinner("[3/4] Shifting name...");
+    let shifted_name = format!("{}.tyz", shift_name(&src_name, args.shift, &a));
+    fs::rename(&compressed, tmp.join(&shifted_name))?;
+    pb.finish_with_message("[3/4] Shifted     ✓");
+
+    let pb = spinner("[4/4] Finalizing...");
+    if dst.exists() {
+        if dst.is_dir() {
+            fs::remove_dir_all(dst)?;
+        } else {
+            fs::remove_file(dst)?;
+        }
+    }
+    fs::rename(tmp.join(&shifted_name), dst)?;
+    fs::remove_dir_all(&tmp)?;
+    pb.finish_with_message("[4/4] Done        ✓");
+
+    Ok(())
+}
+
+fn do_rs(args: &RsArgs) -> io::Result<()> {
+    let a = alphabet();
+    let src = Path::new(&args.target);
+    let dst_str = args.dest.trim_end_matches('/');
+    let dst = Path::new(dst_str);
+
+    if !src.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("target does not exist: {}", args.target),
+        ));
+    }
+
+    if dst.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("--dest must be a file path, not a directory: {}", dst.display()),
+        ));
+    }
+
+    if let Some(p) = dst.parent() {
+        if !p.as_os_str().is_empty() {
+            fs::create_dir_all(p)?;
+        }
+    }
+
+    let tmp = tmp_dir_for(dst)?;
+    if tmp.exists() {
+        fs::remove_dir_all(&tmp)?;
+    }
+    fs::create_dir_all(&tmp)?;
+
+    let src_name = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source path has no filename component"))?
+        .to_string();
+    let shifted_base = src_name.strip_suffix(".tyz").unwrap_or(&src_name);
+    let original_name = unshift_name(shifted_base, args.shift, &a);
+
+    let pb = spinner("[1/4] Preparing...");
+    let tmp_archive = tmp.join(&original_name);
+    fs::copy(src, &tmp_archive)?;
+    pb.finish_with_message("[1/4] Prepared    ✓");
+
+    let pb = spinner("[2/4] Descrambling...");
+    scramble_inplace(&tmp_archive, args.key)?;
+    pb.finish_with_message("[2/4] Descrambled ✓");
+
+    let pb = spinner("[3/4] Decompressing...");
+    let extract_dir = tmp.join("extract");
+    let extracted = extract_archive(&tmp_archive, &extract_dir)?;
+    pb.finish_with_message("[3/4] Decompressed ✓");
+
+    let pb = spinner("[4/4] Finalizing...");
+    if dst.exists() {
+        if dst.is_dir() {
+            fs::remove_dir_all(dst)?;
+        } else {
+            fs::remove_file(dst)?;
+        }
+    }
+    fs::rename(extracted, dst)?;
+    fs::remove_dir_all(&tmp)?;
+    pb.finish_with_message("[4/4] Done        ✓");
+
+    Ok(())
+}
+
+// ── MAIN ─────────────────────────────────────────────────────────────────────
+
 fn main() -> io::Result<()> {
-    let args = Args::parse();
+    let cli = Cli::parse();
+
+    if let Some(cmd) = cli.command {
+        return match cmd {
+            Commands::Bu(args) => do_bu(&args),
+            Commands::Rs(args) => do_rs(&args),
+        };
+    }
+
+    // Legacy flat-arg mode (backward compat with sread/swrite)
+    let target = cli.target.unwrap_or_else(|| {
+        eprintln!("error: --target required");
+        process::exit(1);
+    });
+    let shift = cli.shift.unwrap_or_else(|| {
+        eprintln!("error: --shift required");
+        process::exit(1);
+    });
+    let key = cli.key.unwrap_or_else(|| {
+        eprintln!("error: --key required");
+        process::exit(1);
+    });
 
     let a: Vec<char> = ('a'..='z')
         .chain('A'..='Z')
@@ -31,18 +353,18 @@ fn main() -> io::Result<()> {
         .collect();
     let ext: &str = ".tyz";
 
-    if !Path::new(&args.target).exists() {
-        eprintln!("Specified source does not exist: {}", &args.target);
+    if !Path::new(&target).exists() {
+        eprintln!("Specified source does not exist: {}", &target);
         process::exit(1);
     }
 
-    if !&args.target.chars().all(|c| a.contains(&c)) {
+    if !&target.chars().all(|c| a.contains(&c)) {
         eprintln!("Letters, numbers, and dots only, please.");
         process::exit(1);
     }
 
     let mut cvt: bool = true;
-    if (&args.target).contains(&ext) {
+    if (&target).contains(&ext) {
         println!("...and back again.");
         cvt = false;
     } else {
@@ -50,17 +372,17 @@ fn main() -> io::Result<()> {
     }
 
     let mut srcp: String = String::new();
-    let (a_left, a_right) = a.split_at(args.shift);
+    let (a_left, a_right) = a.split_at(shift);
     let a_s: Vec<_> = a_right.iter().chain(a_left.iter()).cloned().collect();
     let mut from_chars: Vec<char> = Vec::new();
     let mut to_chars: Vec<char> = Vec::new();
 
     if !cvt {
-        srcp = args.target.replace(ext, "");
+        srcp = target.replace(ext, "");
         from_chars = a_s.clone();
         to_chars = a.clone();
     } else {
-        srcp = args.target.to_string();
+        srcp = target.to_string();
         from_chars = a.clone();
         to_chars = a_s.clone();
     }
@@ -79,11 +401,11 @@ fn main() -> io::Result<()> {
         tf.push_str(ext);
     }
 
-    println!("{} -> {}", args.target, tf);
+    println!("{} -> {}", target, tf);
 
-    let mut inf = File::open(args.target)?;
+    let mut inf = File::open(target)?;
     let mut outf = File::create(tf)?;
-    let lve: u8 = args.key as u8;
+    let lve: u8 = key as u8;
 
     let mut buffer = [0; 4096];
     loop {
@@ -91,12 +413,10 @@ fn main() -> io::Result<()> {
         if bytes_read == 0 {
             break;
         }
-
         let scrambled_bytes: Vec<_> = buffer[..bytes_read]
             .par_iter()
             .map(|&byte| byte ^ lve)
             .collect();
-
         outf.write_all(&scrambled_bytes)?;
     }
 
